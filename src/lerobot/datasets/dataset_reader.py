@@ -19,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import datasets
+import numpy as np
 import torch
 
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
@@ -49,6 +50,8 @@ class DatasetReader:
         video_backend: str,
         delta_timestamps: dict[str, list[float]] | None,
         image_transforms: Callable | None,
+        bg_augment=None,
+        domain_randomization=None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -66,6 +69,8 @@ class DatasetReader:
                 relative timestamp offsets for temporal context windows.
             image_transforms: Optional torchvision v2 transform applied to
                 visual features.
+            bg_augment: Optional BgAugmentConfig for online background compositing.
+            domain_randomization: Optional DomainRandomizationConfig for online augmentations.
         """
         self._meta = meta
         self.root = root
@@ -73,6 +78,35 @@ class DatasetReader:
         self._tolerance_s = tolerance_s
         self._video_backend = video_backend
         self._image_transforms = image_transforms
+
+        # BgCompositor initialization (textures cached once at init time)
+        self._bg_compositor = None
+        self._bg_mask_subdir = "masks"
+        if bg_augment is not None and bg_augment.enable:
+            from lerobot.datasets.augmentation.bg_compositing import BgCompositor
+
+            self._bg_compositor = BgCompositor(
+                texture_dir=bg_augment.texture_dir,
+                bg_mode=bg_augment.bg_mode,
+                p_bg=bg_augment.p_bg,
+                resolution=bg_augment.texture_resolution,
+            )
+            self._bg_mask_subdir = bg_augment.mask_subdir
+
+        # Domain randomization initialization
+        self._domain_randomization = None
+        if domain_randomization is not None and domain_randomization.enable:
+            from lerobot.datasets.augmentation.domain_randomization import DomainRandomization
+
+            self._domain_randomization = DomainRandomization(
+                enable_lighting=domain_randomization.enable_lighting,
+                enable_noise=domain_randomization.enable_noise,
+                enable_crop=domain_randomization.enable_crop,
+                p=domain_randomization.p,
+                lighting_gain_range=domain_randomization.lighting_gain_range,
+                noise_iso_range=domain_randomization.noise_iso_range,
+                crop_ratios=domain_randomization.crop_ratios,
+            )
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -246,6 +280,45 @@ class DatasetReader:
 
         return item
 
+    def _get_mask_path(self, ep_idx: int) -> Path:
+        """Return masks.npz path for the given episode index."""
+        return self.root / self._bg_mask_subdir / f"ep{ep_idx:06d}" / "masks.npz"
+
+    def _get_frame_indices(self, query_ts: list[float], ep_idx: int) -> list[int]:
+        """Convert query timestamps to masks.npz frame indices."""
+        ep = self._meta.episodes[ep_idx]
+        first_vid_key = self._meta.video_keys[0]
+        from_ts = ep[f"videos/{first_vid_key}/from_timestamp"]
+        fps = self._meta.fps
+        return [max(0, round((ts - from_ts) * fps)) for ts in query_ts]
+
+    def _load_masks(
+        self,
+        mask_path: Path,
+        frame_indices: list[int],
+        expected_T: int,
+    ) -> dict[str, np.ndarray]:
+        """Load and slice masks from masks.npz for given frame indices.
+
+        Returns:
+            {"table": (T,H,W), "floor": (T,H,W), "wall": (T,H,W)} uint8.
+            Only includes regions present in the file. Returns {} on error.
+        """
+        try:
+            data = np.load(mask_path)
+        except Exception:
+            return {}
+
+        result = {}
+        for region in ("table", "floor", "wall"):
+            if region not in data:
+                continue
+            arr = data[region]  # (T_full, H, W)
+            T_max = arr.shape[0]
+            safe_indices = [min(i, T_max - 1) for i in frame_indices]
+            result[region] = arr[safe_indices]  # (T, H, W)
+        return result
+
     def get_item(self, idx) -> dict:
         """Core __getitem__ logic. Assumes hf_dataset is loaded.
 
@@ -269,6 +342,52 @@ class DatasetReader:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
+
+            # ── step 3.5: online_bg compositing ──
+            if self._bg_compositor is not None:
+                mask_path = self._get_mask_path(ep_idx)
+                if mask_path.exists():
+                    for cam in self._meta.camera_keys:
+                        if cam not in video_frames:
+                            continue
+                        frames_t = video_frames[cam]  # float32 [0,1]
+                        single = frames_t.ndim == 3  # (C,H,W) single frame
+                        if single:
+                            frames_t = frames_t.unsqueeze(0)  # (1,C,H,W)
+
+                        T = frames_t.shape[0]
+                        frame_indices = self._get_frame_indices(query_timestamps[cam], ep_idx)
+                        masks = self._load_masks(mask_path, frame_indices, T)
+                        if masks:
+                            # float [0,1] (T,C,H,W) → uint8 (T,H,W,C)
+                            frames_u8 = (
+                                frames_t.permute(0, 2, 3, 1).mul(255).byte().numpy()
+                            )
+                            frames_u8 = self._bg_compositor.apply(frames_u8, masks)
+                            # uint8 (T,H,W,C) → float [0,1] (T,C,H,W)
+                            frames_t = (
+                                torch.from_numpy(frames_u8).permute(0, 3, 1, 2).float().div(255.0)
+                            )
+                            if single:
+                                frames_t = frames_t.squeeze(0)
+                            video_frames[cam] = frames_t
+
+            # ── step 3.6: online domain randomization (lighting/noise/crop) ──
+            if self._domain_randomization is not None:
+                for cam in self._meta.camera_keys:
+                    if cam not in video_frames:
+                        continue
+                    frames_t = video_frames[cam]
+                    single = frames_t.ndim == 3
+                    if single:
+                        frames_t = frames_t.unsqueeze(0)
+                    frames_u8 = frames_t.permute(0, 2, 3, 1).mul(255).byte().numpy()
+                    frames_u8 = self._domain_randomization(frames_u8)
+                    frames_t = torch.from_numpy(frames_u8).permute(0, 3, 1, 2).float().div(255.0)
+                    if single:
+                        frames_t = frames_t.squeeze(0)
+                    video_frames[cam] = frames_t
+
             item = {**video_frames, **item}
 
         if self._image_transforms is not None:

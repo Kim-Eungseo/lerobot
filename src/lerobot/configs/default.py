@@ -16,7 +16,7 @@
 
 from dataclasses import dataclass, field
 
-from lerobot.datasets.transforms import ImageTransformsConfig
+from lerobot.datasets.transforms import BgAugmentConfig, DomainRandomizationConfig, ImageTransformsConfig
 from lerobot.datasets.video_utils import get_safe_default_codec
 
 
@@ -32,6 +32,8 @@ class DatasetConfig:
     root: str | None = None
     episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
+    bg_augment: BgAugmentConfig = field(default_factory=BgAugmentConfig)
+    domain_randomization: DomainRandomizationConfig = field(default_factory=DomainRandomizationConfig)
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)

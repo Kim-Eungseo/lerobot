@@ -258,3 +258,29 @@ class ImageTransforms(Transform):
 
     def forward(self, *inputs: Any) -> Any:
         return self.tf(*inputs)
+
+
+@dataclass
+class BgAugmentConfig:
+    """Online background texture compositing config."""
+
+    enable: bool = False
+    texture_dir: str = ""
+    p_bg: float = 0.8
+    bg_mode: str = "both"  # "paste" | "hsv" | "both"
+    mask_subdir: str = "masks"
+    texture_resolution: int = 256
+
+
+@dataclass
+class DomainRandomizationConfig:
+    """Online domain randomization config (lighting, noise, crop)."""
+
+    enable: bool = False
+    p: float = 0.8
+    enable_lighting: bool = True
+    enable_noise: bool = True
+    enable_crop: bool = True
+    lighting_gain_range: tuple[float, float] = (0.3, 2.0)
+    noise_iso_range: tuple[int, int] = (1, 5)
+    crop_ratios: list[float] = field(default_factory=lambda: [0.05, 0.10])
