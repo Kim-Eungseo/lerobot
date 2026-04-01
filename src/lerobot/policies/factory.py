@@ -39,6 +39,7 @@ from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
 from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvlm_act.configuration_smolvlm_act import SmolVLMActConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
@@ -119,6 +120,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "smolvlm_act":
+        from lerobot.policies.smolvlm_act.modeling_smolvlm_act import SmolVLMActPolicy
+
+        return SmolVLMActPolicy
     elif name == "sarm":
         from lerobot.policies.sarm.modeling_sarm import SARMRewardModel
 
@@ -179,6 +184,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SACConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
+    elif policy_type == "smolvlm_act":
+        return SmolVLMActConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
     elif policy_type == "groot":
@@ -369,6 +376,14 @@ def make_pre_post_processors(
         from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 
         processors = make_smolvla_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, SmolVLMActConfig):
+        from lerobot.policies.smolvlm_act.processor_smolvlm_act import make_smolvlm_act_pre_post_processors
+
+        processors = make_smolvlm_act_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
