@@ -53,9 +53,14 @@ class SmolVLMActConfig(PreTrainedConfig):
     # Learnable action token
     action_token_init_std: float = 0.02
 
-    # Action head MLP
+    # Action head
+    action_head_type: str = "mlp"  # "mlp", "resnet", or "diffusion"
     action_head_hidden_dim: int = 2048
-    action_head_num_layers: int = 3
+    action_head_num_layers: int = 3  # for "mlp" head
+    action_head_num_blocks: int = 2  # for "resnet" and "diffusion" heads
+    # Diffusion-specific
+    diffusion_num_train_steps: int = 50
+    diffusion_num_infer_steps: int = 10
 
     # Training presets
     optimizer_lr: float = 5e-5

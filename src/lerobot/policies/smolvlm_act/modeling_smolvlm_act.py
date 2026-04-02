@@ -129,15 +129,28 @@ class SmolVLM2WithActionToken(nn.Module):
             for p in self.state_proj.parameters():
                 p.requires_grad = False
 
-        # Action head
+        # Action head (supports multiple types via config.action_head_type)
+        from lerobot.policies.smolvlm_act.action_heads import build_action_head
         original_action_dim = config.max_action_dim
-        self.action_head = ActionHead(
+        head_type = getattr(config, "action_head_type", "mlp")
+        head_kwargs = {}
+        if head_type == "mlp":
+            head_kwargs["num_layers"] = config.action_head_num_layers
+        elif head_type == "resnet":
+            head_kwargs["num_blocks"] = getattr(config, "action_head_num_blocks", 2)
+        elif head_type == "diffusion":
+            head_kwargs["num_blocks"] = getattr(config, "action_head_num_blocks", 2)
+            head_kwargs["num_train_steps"] = getattr(config, "diffusion_num_train_steps", 50)
+            head_kwargs["num_infer_steps"] = getattr(config, "diffusion_num_infer_steps", 10)
+        self.action_head = build_action_head(
+            head_type=head_type,
             hidden_dim=hidden_dim,
             action_dim=original_action_dim,
             chunk_size=config.chunk_size,
             mlp_hidden=config.action_head_hidden_dim,
-            num_layers=config.action_head_num_layers,
+            **head_kwargs,
         )
+        self._action_head_type = head_type
 
         # Token IDs for image processing
         self.fake_image_token = self.processor.tokenizer.fake_image_token_id
@@ -243,16 +256,69 @@ class SmolVLM2WithActionToken(nn.Module):
         return action_hidden
 
     def predict_actions(self, images, img_masks, lang_tokens, lang_masks, state):
-        """Inference: get action chunk from single forward pass."""
+        """Inference: get action chunk from single forward pass (or DDIM denoising for diffusion)."""
         action_hidden = self.forward_with_hidden(images, img_masks, lang_tokens, lang_masks, state)
         return self.action_head(action_hidden.float())  # (B, chunk_size, action_dim)
 
+    def _compute_action_loss(self, action_hidden, gt_actions):
+        """Compute action loss, dispatching to the right method based on head type."""
+        if self._action_head_type == "diffusion":
+            return self.action_head.compute_loss(action_hidden.float(), gt_actions)
+        else:
+            predicted = self.action_head(action_hidden.float())  # (B, chunk_size, action_dim)
+            return F.l1_loss(predicted, gt_actions, reduction="mean")
+
     def compute_loss(self, images, img_masks, lang_tokens, lang_masks, state, gt_actions):
-        """Training: compute L1 loss between predicted and GT actions."""
+        """Training: compute action loss (L1 for mlp/resnet, MSE noise for diffusion)."""
         action_hidden = self.forward_with_hidden(images, img_masks, lang_tokens, lang_masks, state)
-        predicted = self.action_head(action_hidden.float())  # (B, chunk_size, action_dim)
-        # Return per-element loss for downstream masking
-        return F.l1_loss(predicted, gt_actions, reduction="none")
+        if self._action_head_type == "diffusion":
+            # Diffusion returns scalar MSE loss on noise prediction
+            return self.action_head.compute_loss(action_hidden.float(), gt_actions).unsqueeze(0)
+        else:
+            predicted = self.action_head(action_hidden.float())
+            return F.l1_loss(predicted, gt_actions, reduction="none")
+
+    def compute_stage2_loss(self, images, img_masks, lang_tokens, lang_masks,
+                            state, gt_actions, z_target, pred_head,
+                            lambda_action=1.0, latent_loss_type="mse"):
+        """Stage 2: joint latent alignment + action prediction.
+
+        Args:
+            images, img_masks, lang_tokens, lang_masks, state: standard VLM inputs
+            gt_actions: [B, chunk_size, action_dim] ground truth actions
+            z_target: [B, proj_dim] frozen V-JEPA2 target latent (detached)
+            pred_head: LatentPredictionHead module
+            lambda_action: weight for action loss
+            latent_loss_type: "mse" or "l1"
+
+        Returns:
+            loss: scalar total loss
+            metrics: dict with l_latent, l_action, cosine_sim
+        """
+        action_hidden = self.forward_with_hidden(images, img_masks, lang_tokens, lang_masks, state)
+
+        # Latent prediction -> align with V-JEPA2
+        z_pred = pred_head(action_hidden)  # (B, proj_dim)
+        z_target = z_target.detach()
+        if latent_loss_type == "l1":
+            l_latent = F.l1_loss(z_pred, z_target)
+        else:
+            l_latent = F.mse_loss(z_pred, z_target)
+
+        # Action prediction (dispatches correctly for diffusion vs mlp/resnet)
+        l_action = self._compute_action_loss(action_hidden, gt_actions)
+
+        loss = l_latent + lambda_action * l_action
+
+        with torch.no_grad():
+            cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean()
+
+        metrics = {
+            "l_latent": l_latent.item(),
+            "l_action": l_action.item(),
+            "cosine_sim": cos_sim.item(),
+        }
+        return loss, metrics
 
 
 # ─── Policy Wrapper ──────────────────────────────────────────────────
