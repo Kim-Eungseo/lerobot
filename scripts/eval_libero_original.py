@@ -109,6 +109,9 @@ def parse_args():
     parser.add_argument("--action_head_type", type=str, default="mlp", choices=["mlp", "resnet", "diffusion"])
     parser.add_argument("--chunk_size", type=int, default=10)
     parser.add_argument("--lora_rank", type=int, default=32)
+    parser.add_argument("--no_lora", action="store_true", help="Disable LoRA (for full finetune checkpoints)")
+    parser.add_argument("--pooling_type", type=str, default="action_token", choices=["action_token", "attentive"])
+    parser.add_argument("--attentive_pooling_heads", type=int, default=8)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
@@ -123,16 +126,27 @@ def quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
+LIBERO_DATASETS = {
+    "libero_spatial": "lerobot/libero_spatial_image",
+    "libero_object": "lerobot/libero_object_image",
+    "libero_goal": "lerobot/libero_goal_image",
+    "libero_10": "lerobot/libero_10_image",
+}
+
+
 def load_policy(args, device):
     """Load trained SmolVLM-Act policy from checkpoint."""
     from lerobot.configs.types import FeatureType, PolicyFeature
 
     cfg = SmolVLMActConfig(
         vlm_model_name=args.vlm_model, load_vlm_weights=True,
-        freeze_vision_encoder=True, use_lora=True, lora_rank=args.lora_rank,
+        freeze_vision_encoder=True, use_lora=not args.no_lora, lora_rank=args.lora_rank,
         chunk_size=args.chunk_size, n_action_steps=args.chunk_size,
         action_head_type=args.action_head_type,
+        pooling_type=args.pooling_type,
+        attentive_pooling_heads=args.attentive_pooling_heads,
         train_state_proj=False, empty_cameras=0, max_state_dim=32, max_action_dim=32,
+        resize_imgs_with_padding=(256, 256),
     )
     cfg.input_features = {
         "observation.images.camera1": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
@@ -149,25 +163,44 @@ def load_policy(args, device):
     policy.load_state_dict(ckpt["model_state_dict"])
     logging.info(f"Loaded checkpoint from {args.checkpoint} (step {ckpt.get('step', '?')})")
 
+    # Load real dataset stats for proper unnormalization
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    dataset_name = LIBERO_DATASETS.get(args.task_suite, LIBERO_DATASETS["libero_spatial"])
+    logging.info(f"Loading dataset stats from {dataset_name}...")
+    dataset = LeRobotDataset(repo_id=dataset_name, episodes=[0])
+    stats = dict(dataset.meta.stats)
+
+    agg_stats = {}
+    if "action" in stats:
+        agg_stats["action"] = stats["action"]
+    else:
+        agg_stats["action"] = {"mean": torch.zeros(7), "std": torch.ones(7), "min": -torch.ones(7), "max": torch.ones(7)}
+    for stats_type, stats_val in IMAGENET_STATS.items():
+        agg_stats.setdefault("observation.images.image", {})[stats_type] = torch.tensor(stats_val, dtype=torch.float32)
+    if "observation.state" in stats:
+        agg_stats["observation.state"] = stats["observation.state"]
+    else:
+        agg_stats["observation.state"] = {"mean": torch.zeros(8), "std": torch.ones(8), "min": torch.zeros(8), "max": torch.ones(8)}
+
+    # Extract action stats for manual unnormalization
+    action_mean = agg_stats["action"]["mean"].numpy() if hasattr(agg_stats["action"]["mean"], "numpy") else np.asarray(agg_stats["action"]["mean"], dtype=np.float32)
+    action_std = agg_stats["action"]["std"].numpy() if hasattr(agg_stats["action"]["std"], "numpy") else np.asarray(agg_stats["action"]["std"], dtype=np.float32)
+
     preprocessor, _ = make_smolvlm_act_pre_post_processors(
         config=cfg,
-        dataset_stats={
-            "observation.images.image": {k: torch.tensor(v, dtype=torch.float32) for k, v in IMAGENET_STATS.items()},
-            "observation.state": {"mean": torch.zeros(8), "std": torch.ones(8), "min": torch.zeros(8), "max": torch.ones(8)},
-            "action": {"mean": torch.zeros(7), "std": torch.ones(7), "min": -torch.ones(7), "max": torch.ones(7)},
-        },
+        dataset_stats=agg_stats,
     )
-    return policy, preprocessor, cfg
+    return policy, preprocessor, cfg, action_mean, action_std
 
 
 @torch.no_grad()
-def run_episode(policy, preprocessor, env, task_description, max_steps, chunk_size, device):
+def run_episode(policy, preprocessor, env, task_description, max_steps, chunk_size, device,
+                action_mean=None, action_std=None):
     """Run one episode, return success bool."""
     action_queue = deque()
+    obs = env._last_obs
 
     for t in range(max_steps):
-        obs = env._env._get_observations() if t > 0 else env._last_obs
-
         if len(action_queue) == 0:
             img = obs["agentview_image"][::-1, ::-1].copy()
             img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
@@ -194,11 +227,16 @@ def run_episode(policy, preprocessor, env, task_description, max_steps, chunk_si
                     images, img_masks, lang_tokens, lang_masks, obs_state
                 )
             actions = action_chunk[0].float().cpu().numpy()[:, :7]
+
+            # Unnormalize actions using dataset stats
+            if action_mean is not None and action_std is not None:
+                actions = actions * (action_std[:7] + 1e-8) + action_mean[:7]
+
             for a in actions:
                 action_queue.append(a)
 
         action = action_queue.popleft()
-        action[-1] = 1.0 if action[-1] >= 0.5 else -1.0
+        action[-1] = 1.0 if action[-1] >= 0.0 else -1.0
 
         obs, reward, done, info = env.step(action.tolist())
         if done:
@@ -221,7 +259,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load policy
-    policy, preprocessor, cfg = load_policy(args, device)
+    policy, preprocessor, cfg, action_mean, action_std = load_policy(args, device)
     policy.eval()
 
     # Load LIBERO env
@@ -272,7 +310,8 @@ def main():
                 obs, _, _, _ = env.step([0, 0, 0, 0, 0, 0, -1])
             env._last_obs = obs
 
-            success = run_episode(policy, preprocessor, env, task_description, max_steps, args.chunk_size, device)
+            success = run_episode(policy, preprocessor, env, task_description, max_steps, args.chunk_size, device,
+                                 action_mean=action_mean, action_std=action_std)
             task_successes += int(success)
             total_successes += int(success)
             total_episodes += 1

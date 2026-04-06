@@ -50,6 +50,10 @@ class SmolVLMActConfig(PreTrainedConfig):
         default_factory=lambda: ["q_proj", "v_proj"]
     )
 
+    # Pooling type: "action_token" (append learnable token) or "attentive" (cross-attention pooling)
+    pooling_type: str = "action_token"
+    attentive_pooling_heads: int = 8
+
     # Learnable action token
     action_token_init_std: float = 0.02
 

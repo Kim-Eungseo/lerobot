@@ -40,6 +40,68 @@ class LearnableActionToken(nn.Module):
         return self.token_embedding.expand(batch_size, -1, -1)
 
 
+# ─── Attentive Pooling ──────────────────────────────────────────────
+
+class AttentivePooling(nn.Module):
+    """Cross-attention pooling: learned query attends to VLM hidden states.
+
+    Produces a single (B, hidden_dim) vector from variable-length sequences.
+    Uses multi-head cross-attention with a single learned query token.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 8, init_std: float = 0.02):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.query = nn.Parameter(torch.randn(1, 1, hidden_dim) * init_std)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, hidden_states: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        """
+        Args:
+            hidden_states: (B, seq_len, D) — VLM output hidden states
+            attention_mask: (B, seq_len) — True for valid positions
+        Returns:
+            (B, D) — pooled representation
+        """
+        B, S, D = hidden_states.shape
+
+        # Learned query: (B, 1, D)
+        q = self.q_proj(self.query.expand(B, -1, -1))
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        # Reshape for multi-head attention: (B, num_heads, seq, head_dim)
+        q = q.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Apply mask: (B, 1, 1, S)
+        if attention_mask is not None:
+            attn_mask = attention_mask[:, None, None, :]  # (B, 1, 1, S)
+            attn_weights = attn_weights.masked_fill(~attn_mask, float("-inf"))
+
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_output = torch.matmul(attn_weights, v)  # (B, num_heads, 1, head_dim)
+
+        # Reshape back
+        attn_output = attn_output.transpose(1, 2).reshape(B, 1, D)
+        attn_output = self.out_proj(attn_output)
+
+        # Residual + LayerNorm (query residual)
+        pooled = self.layer_norm(self.query.expand(B, -1, -1) + attn_output)
+        return pooled.squeeze(1)  # (B, D)
+
+
 # ─── Action Head ─────────────────────────────────────────────────────
 
 class ActionHead(nn.Module):
@@ -120,8 +182,16 @@ class SmolVLM2WithActionToken(nn.Module):
             for p in self.vlm.model.vision_model.parameters():
                 p.requires_grad = False
 
-        # Learnable action token
-        self.action_token = LearnableActionToken(hidden_dim, init_std=config.action_token_init_std)
+        # Pooling: action_token or attentive
+        self._pooling_type = getattr(config, "pooling_type", "action_token")
+        if self._pooling_type == "attentive":
+            self.attentive_pool = AttentivePooling(
+                hidden_dim,
+                num_heads=getattr(config, "attentive_pooling_heads", 8),
+                init_std=config.action_token_init_std,
+            )
+        else:
+            self.action_token = LearnableActionToken(hidden_dim, init_std=config.action_token_init_std)
 
         # State projection
         self.state_proj = nn.Linear(config.max_state_dim, hidden_dim)
@@ -224,35 +294,55 @@ class SmolVLM2WithActionToken(nn.Module):
         return prefix_embs, prefix_mask
 
     def forward_with_hidden(self, images, img_masks, lang_tokens, lang_masks, state):
-        """Full forward: prefix + action token -> VLM -> last hidden at action position."""
+        """Full forward: prefix -> VLM -> extract action representation.
+
+        For action_token pooling: append learnable token, extract last position.
+        For attentive pooling: no extra token, cross-attention pool over all hidden states.
+        """
         prefix_embs, prefix_mask = self.build_prefix_embeds(
             images, img_masks, lang_tokens, lang_masks, state
         )
         B = prefix_embs.shape[0]
         device = prefix_embs.device
 
-        # Append learnable action token
-        action_emb = self.action_token.expand(B).to(dtype=prefix_embs.dtype, device=device)
-        full_embs = torch.cat([prefix_embs, action_emb], dim=1)  # (B, seq+1, D)
+        if self._pooling_type == "attentive":
+            # No action token — just forward prefix through LM
+            full_embs = prefix_embs
+            full_mask = prefix_mask
 
-        action_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
-        full_mask = torch.cat([prefix_mask, action_mask], dim=1)
+            seq_len = full_embs.shape[1]
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+            causal_mask = causal_mask[None, None, :, :] & full_mask[:, None, None, :]
 
-        # Causal attention mask
-        seq_len = full_embs.shape[1]
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-        # Apply padding mask
-        causal_mask = causal_mask[None, None, :, :] & full_mask[:, None, None, :]
+            lm = self.get_language_model()
+            hidden_states = lm(
+                inputs_embeds=full_embs,
+                attention_mask=causal_mask,
+            ).last_hidden_state  # (B, seq, D)
 
-        # Forward through language model
-        lm = self.get_language_model()
-        hidden_states = lm(
-            inputs_embeds=full_embs,
-            attention_mask=causal_mask,
-        ).last_hidden_state  # (B, seq+1, D)
+            # Attentive pooling over all hidden states
+            action_hidden = self.attentive_pool(hidden_states, prefix_mask)  # (B, D)
+        else:
+            # Append learnable action token
+            action_emb = self.action_token.expand(B).to(dtype=prefix_embs.dtype, device=device)
+            full_embs = torch.cat([prefix_embs, action_emb], dim=1)  # (B, seq+1, D)
 
-        # Extract the last position (action token)
-        action_hidden = hidden_states[:, -1, :]  # (B, D)
+            action_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
+            full_mask = torch.cat([prefix_mask, action_mask], dim=1)
+
+            seq_len = full_embs.shape[1]
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+            causal_mask = causal_mask[None, None, :, :] & full_mask[:, None, None, :]
+
+            lm = self.get_language_model()
+            hidden_states = lm(
+                inputs_embeds=full_embs,
+                attention_mask=causal_mask,
+            ).last_hidden_state  # (B, seq+1, D)
+
+            # Extract the last position (action token)
+            action_hidden = hidden_states[:, -1, :]  # (B, D)
+
         return action_hidden
 
     def predict_actions(self, images, img_masks, lang_tokens, lang_masks, state):

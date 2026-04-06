@@ -67,7 +67,8 @@ lerobot/
 | 모듈 | 역할 | 파라미터 |
 |------|------|----------|
 | `vlm` | SmolVLM2-500M (SigLIP vision + LLaMA LM) | ~500M (대부분 frozen) |
-| `action_token` | Learnable `<ACTION>` embedding `nn.Parameter(1, 1, 1536)` | 1,536 |
+| `action_token` | (action_token 모드) Learnable `<ACTION>` embedding `nn.Parameter(1, 1, 1536)` | 1,536 |
+| `attentive_pool` | (attentive 모드) Cross-attention pooling (QKV proj + out proj + LN) | ~18.9M |
 | `state_proj` | Robot state → LM hidden dim `Linear(32, 1536)` | 49K (frozen by default) |
 | `action_head` | Hidden state → action chunk (타입 선택 가능) | 8~15M |
 | LoRA adapters | LM의 q_proj, v_proj에 rank-32 LoRA | ~2.4M |
@@ -82,6 +83,93 @@ lerobot/
 7. LM forward → hidden_states `(B, total_seq, 1536)`
 8. `hidden_states[:, -1, :]` → action token의 hidden state `(B, 1536)`
 9. `action_head(hidden_state)` → `(B, chunk_size, action_dim)`
+
+
+### Pooling 방식 (`pooling_type` config)
+
+VLM hidden states에서 action representation을 추출하는 두 가지 방식을 지원한다.
+`pooling_type` config 또는 `--pooling_type` CLI 인자로 선택.
+
+#### Action Token Pooling (`"action_token"`, default)
+
+```
+Input: [image_tokens] [lang_tokens] [state_emb] [<ACTION>]
+                                                     ↓
+                        SmolVLM2 LM (causal attention)
+                                                     ↓
+                              hidden_states[:, -1, :]  →  (B, 1536)
+                                                     ↓
+                                              Action Head
+                                                     ↓
+                                        (B, chunk_size, action_dim)
+```
+
+Learnable action token `<ACTION>`을 시퀀스 맨 끝에 append.
+Causal attention 덕분에 이 토큰이 앞의 모든 토큰 (이미지 + 언어 + state) 정보를 집약.
+마지막 위치의 hidden state 하나를 뽑아서 action head에 전달.
+
+#### Attentive Pooling (`"attentive"`)
+
+```
+Input: [image_tokens] [lang_tokens] [state_emb]
+                          ↓
+       SmolVLM2 LM (causal attention)
+                          ↓
+            hidden_states  →  (B, seq_len, 1536)
+                          ↓
+        ┌─────────────────────────────────┐
+        │       AttentivePooling          │
+        │                                 │
+        │  learned query (1, 1, 1536)     │
+        │        ↓                        │
+        │  Multi-Head Cross-Attention     │
+        │  (query attends to all hidden   │
+        │   states, with padding mask)    │
+        │        ↓                        │
+        │  out_proj + residual + LayerNorm│
+        └─────────────────┬───────────────┘
+                          ↓
+                     (B, 1536)
+                          ↓
+                    Action Head
+                          ↓
+              (B, chunk_size, action_dim)
+```
+
+Action token 없이 VLM을 forward한 뒤, learned query가 전체 hidden states에 대해
+multi-head cross-attention으로 정보를 pooling. Bidirectional attention으로 모든 위치의
+정보를 동시에 참조할 수 있어, causal attention의 순서 편향 없이 전역 정보를 집약.
+
+**구성요소:**
+- `query`: `nn.Parameter(1, 1, hidden_dim)` — 학습 가능한 쿼리 벡터
+- `q_proj`, `k_proj`, `v_proj`: `nn.Linear(hidden_dim, hidden_dim)` — QKV 프로젝션
+- `out_proj`: `nn.Linear(hidden_dim, hidden_dim)` — 출력 프로젝션
+- `layer_norm`: `nn.LayerNorm(hidden_dim)` — 잔차 연결 후 정규화
+- `num_heads`: 8 (default, `--attentive_pooling_heads`로 조절)
+
+**Action token과의 차이:**
+| | Action Token | Attentive Pooling |
+|---|---|---|
+| VLM 입력 | 시퀀스 + 1 토큰 (추가 연산) | 시퀀스만 (토큰 추가 없음) |
+| 정보 집약 | Causal (앞→뒤 단방향) | Cross-attention (전방향) |
+| 추가 파라미터 | 1,536 (토큰 임베딩) | ~18.9M (QKV + out proj + LN) |
+| VLM forward | seq+1 길이 | seq 길이 (1 토큰 짧음) |
+
+**사용법:**
+```bash
+# 학습
+python scripts/train_eval_libero_smolvlm_act.py \
+    --pooling_type attentive \
+    --attentive_pooling_heads 8 \
+    --task_suite libero_spatial \
+    --steps 120000
+
+# 평가
+python scripts/eval_libero_original.py \
+    --checkpoint path/to/checkpoint.pt \
+    --pooling_type attentive \
+    --task_suite libero_spatial
+```
 
 
 ### 2. Action Heads (`action_heads.py`)
