@@ -1,98 +1,169 @@
 # SmolVLM-Act LIBERO Spatial Evaluation Results
 
-## Config
+## Best Results Summary (Original LIBERO, 10 tasks × 50 episodes)
 
+| Rank | Model | Pooling | Head | Best Step | **Overall SR** |
+| ---- | ----- | ------- | ---- | --------- | -------------- |
+| 1 | **2.2B Attentive + MLP** | attentive | MLP | 190k | **84.2%** |
+| 2 | 2.2B AT + MLP (run2) | action_token | MLP | 190k | 83.8% |
+| 3 | 2.2B AT + MLP (run2 130k) | action_token | MLP | 130k/140k | 83.4% |
+| 4 | 2.2B AT + MLP (run1) | action_token | MLP | 110k | 81.4% |
+| 5 | 500M Attentive + MLP | attentive | MLP | 90k | 80.4% |
+| 6 | 500M AT + MLP | action_token | MLP | 110k | 78.4% |
+| 7 | 500M Diffusion (mislabeled) | action_token | MLP run2 | 120k | 72.2% |
+| 8 | 500M Full FT | action_token | MLP | 40k | 59.6% |
+| 9 | 2.2B Attentive + Diffusion | attentive | Diffusion | 120k | 45.2% |
+| 10 | 2.2B AT + Diffusion | action_token | Diffusion | 120k | 34.8% |
 
-|                | MLP LoRA 30k                 | MLP LoRA 40k                 | MLP Full FT 40k              | Diffusion LoRA 30k           |
-| -------------- | ---------------------------- | ---------------------------- | ---------------------------- | ---------------------------- |
-| VLM            | SmolVLM2-500M-Video-Instruct | SmolVLM2-500M-Video-Instruct | SmolVLM2-500M-Video-Instruct | SmolVLM2-500M-Video-Instruct |
-| Action Head    | MLP                          | MLP                          | MLP                          | Diffusion (DDIM 10 steps)    |
-| LoRA           | rank 32                      | rank 32                      | No (full finetune)           | rank 32                      |
-| Training Steps | 30,000                       | 40,000                       | 40,000                       | 30,000                       |
-| Chunk Size     | 10                           | 10                           | 10                           | 10                           |
-| LR             | 5e-5                         | 5e-5                         | 5e-5                         | 5e-5                         |
-| Batch Size     | 8                            | 8                            | 8                            | 8                            |
-| Dataset        | lerobot/libero_spatial_image | lerobot/libero_spatial_image | lerobot/libero_spatial_image | lerobot/libero_spatial_image |
+## 2.2B Step Scaling
 
+### Attentive + MLP (Best so far)
 
-## Overall Results (LIBERO-plus, 258 task variants)
+| Step | SR |
+| ---- | -- |
+| 90k  | 80.6% |
+| 100k | 81.0% |
+| 110k | 82.2% |
+| 120k | 81.6% |
+| 130k | 82.6% |
+| 150k | 82.0% |
+| 170k | 81.0% |
+| **190k** | **84.2%** |
+| 200k | 80.8% |
 
+### Action Token + MLP — Run2
 
-| Model          | Overall SR | Successes | Total Episodes | Total Tasks |
-| -------------- | ---------- | --------- | -------------- | ----------- |
-| **MLP LoRA**   | **5.8%**   | 298       | 5,160          | 258         |
-| Diffusion LoRA | 2.4%       | 125       | 5,160          | 258         |
+| Step | SR |
+| ---- | -- |
+| 90k  | 83.2% |
+| 120k | 82.8% |
+| 130k | 83.4% |
+| 140k | 83.4% |
+| 150k | 78.0% |
+| 170k | 80.2% |
+| **190k** | **83.8%** |
+| 200k | 83.0% |
 
+### Action Token + MLP — Run1 (different seed)
 
-- 20 episodes per task, 280 max steps per episode
+| Step | SR |
+| ---- | -- |
+| 60k  | 77.8% |
+| 90k  | 81.2% |
+| **110k** | **81.4%** |
+| 120k | 77.2% |
 
-## Per Base Task Breakdown
+### Attentive + MLP, chunk_size=20
 
+| Step | SR |
+| ---- | -- |
+| 90k  | 74.8% |
+| **110k** | **79.0%** |
+| 120k | 64.2% |
 
-| Base Task                                        | MLP avg | MLP max | Diff avg | Diff max | # variants |
-| ------------------------------------------------ | ------- | ------- | -------- | -------- | ---------- |
-| between the plate and the ramekin -> plate       | 6.2%    | 30%     | 0.9%     | 15%      | 29         |
-| from table center -> plate                       | 4.0%    | 60%     | 9.6%     | 50%      | 46         |
-| in the top drawer of the wooden cabinet -> plate | 2.7%    | 20%     | 0.2%     | 5%       | 26         |
-| next to the cookie box -> plate                  | 12.3%   | 25%     | 0.0%     | 0%       | 20         |
-| next to the plate -> plate                       | 0.0%    | 0%      | 0.0%     | 0%       | 6          |
-| next to the ramekin -> plate                     | 0.5%    | 5%      | 0.0%     | 0%       | 10         |
-| on the cookie box -> plate                       | 24.4%   | 75%     | 4.5%     | 15%      | 31         |
-| on the ramekin -> plate                          | 1.1%    | 10%     | 0.4%     | 10%      | 35         |
-| on the stove -> plate                            | 0.0%    | 0%      | 0.0%     | 0%       | 41         |
-| on the wooden cabinet -> plate                   | 0.7%    | 5%      | 0.0%     | 0%       | 14         |
+→ chunk_size=20 → chunk_size=10보다 일관되게 낮음 (open-loop 누적 에러)
 
+### Action Token + Diffusion (real)
 
-## Original LIBERO Results (10 tasks, 50 episodes/task)
+| Step | SR |
+| ---- | -- |
+| 90k  | 20.2% |
+| **120k** | **34.8%** |
+| 150k | 27.4% |
 
-### MLP LoRA bs8 — Step Scaling
+### Attentive + Diffusion
 
-| Task                             | 30k   | 40k   | 50k    | 60k   | 70k   | **80k**  |
-| -------------------------------- | ----- | ----- | ------ | ----- | ----- | -------- |
-| between plate & ramekin -> plate | 84%   | 84%   | **100%** | 98% | 86%   | 80%      |
-| from table center -> plate       | 40%   | 40%   | **82%** | 66%  | 76%   | 74%      |
-| in top drawer -> plate           | 72%   | 72%   | 74%    | 74%   | 80%   | **86%**  |
-| next to cookie box -> plate      | **98%** | **98%** | 94%  | **98%** | 96% | 96%      |
-| next to plate -> plate           | **74%** | **74%** | 68%  | 66%   | **74%** | 72%   |
-| next to ramekin -> plate         | 72%   | 72%   | 74%    | 60%   | **78%** | 72%    |
-| on cookie box -> plate           | 72%   | 72%   | 84%    | 74%   | 80%   | **90%**  |
-| on ramekin -> plate              | 24%   | 24%   | 20%    | 10%   | 26%   | **30%**  |
-| on stove -> plate                | 4%    | 4%    | 34%    | 26%   | 40%   | **52%**  |
-| on wooden cabinet -> plate       | 30%   | 30%   | 54%    | **70%** | 68% | **70%**  |
-| **Overall**                      | 57.0% | 57.0% | 68.4%  | 64.2% | 70.4% | **72.2%** |
+| Step | SR |
+| ---- | -- |
+| 90k  | 25.8% |
+| **120k** | **45.2%** |
+| 150k | 32.4% |
 
-### MLP LoRA vs Full FT comparison (40k)
+### Temporal Ensemble Experiments (run2 130k checkpoint)
+
+| 설정 | SR | vs Baseline |
+| ---- | -- | ----------- |
+| **Baseline (exec=10)** | **83.4%** | - |
+| exec=5 (no ensemble) | 81.0% | -2.4 |
+| ensemble uniform (exec=5) | 82.6% | -0.8 |
+| ensemble exp=0.5 (exec=5) | 79.4% | -4.0 |
+
+→ Temporal ensemble은 도움 안 됨. 이 모델은 chunk=10 그대로 실행이 최적.
+
+## 500M Step Scaling
+
+### Action Token + MLP
+
+| Step | SR |
+| ---- | -- |
+| 30k  | 57.0% |
+| 50k  | 68.4% |
+| 70k  | 70.4% |
+| 80k  | 72.2% |
+| 90k  | 73.6% |
+| 100k | 72.6% |
+| **110k** | **78.4%** |
+| 120k | 73.6% |
+
+### Attentive + MLP
+
+| Step | SR |
+| ---- | -- |
+| **90k** | **80.4%** |
+| 100k | 78.4% |
+| 110k | 79.4% |
+| 120k | 79.0% |
+
+### "Diffusion" (actually MLP run2)
+
+| Step | SR |
+| ---- | -- |
+| 90k  | 69.2% |
+| 100k | 71.4% |
+| 110k | 71.2% |
+| **120k** | **72.2%** |
+
+### 500M LoRA vs Full FT (40k)
 
 | Task                             | LoRA 40k | Full FT 40k |
 | -------------------------------- | -------- | ----------- |
-| next to cookie box -> plate      | 92%      | **94%**     |
-| between plate & ramekin -> plate | **86%**  | 74%         |
-| from table center -> plate       | 70%      | **78%**     |
-| in top drawer -> plate           | 70%      | **84%**     |
-| next to plate -> plate           | **66%**  | 60%         |
-| next to ramekin -> plate         | 58%      | **86%**     |
-| on cookie box -> plate           | **78%**  | 58%         |
-| on wooden cabinet -> plate       | 28%      | **38%**     |
-| on ramekin -> plate              | 12%      | **24%**     |
-| on stove -> plate                | **10%**  | 0%          |
 | **Overall**                      | 57.0%    | **59.6%**   |
 
-### LIBERO-plus Overall SR
+## Key Findings
 
-| Model              | LIBERO-plus SR |
-| ------------------ | -------------- |
-| LoRA bs8 30k       | 5.8%           |
-| LoRA bs8 80k       | **15.6%**      |
-| Full FT 40k        | 10.1%          |
-| Diffusion LoRA 30k | 2.4%           |
+1. **Attentive pooling > Action token**: 500M (+2%p), 2.2B (+0.4%p) — 일관된 개선
+2. **2.2B > 500M**: ~5%p 차이, 2.2B는 더 빨리 수렴
+3. **MLP head >> Diffusion head**: Diffusion은 35-45%로 MLP의 절반 수준 (이 데이터 규모에서 수렴 못함)
+4. **chunk_size=10 > chunk_size=20**: open-loop 길수록 누적 에러
+5. **Temporal ensemble 효과 없음**: 재예측 빈도 증가가 오히려 약간의 손실
+6. **장기 학습 효과**: 130k 이후 큰 개선 없이 수렴 (130k~200k 구간 ~83-84% 변동)
+7. **"bowl on ramekin"이 가장 어려움**: 모든 모델에서 8-30%
 
-## Notes
+## Config
 
-- Original LIBERO: 10 tasks, 50 episodes per task, 280 max steps per episode
-- LIBERO-plus: 258 task variants with different table configurations, 20 episodes per task
-- Checkpoints at `outputs/train/smolvlm_act_libero_spatial_{lora_mlp,lora_diffusion,fullft_mlp_40k}/`
-- MLP head significantly outperforms diffusion head
-- Longer training consistently improves: 30k (57%) -> 50k (68%) -> 80k (**72%**)
-- "bowl on stove" improved dramatically with more training: 4% (30k) -> 52% (80k)
-- bs32 80k experiment in progress on GPU 2
+| | 500M | 2.2B |
+|---|---|---|
+| VLM | SmolVLM2-500M-Video-Instruct | SmolVLM2-2.2B-Instruct |
+| LoRA rank | 32 | 32 |
+| Chunk Size | 10 | 10 (or 20) |
+| LR | 5e-5 | 5e-5 |
+| Batch Size | 8 | 8 |
+| Dataset | lerobot/libero_spatial_image | lerobot/libero_spatial_image |
 
+## Checkpoints
+
+| Experiment | Location |
+| ---------- | -------- |
+| 500M MLP LoRA (30k-120k) | `/home/ngseo/lerobot/outputs/train/smolvlm_act_libero_spatial_lora_mlp/` |
+| 500M Full FT (40k) | `/home/ngseo/lerobot/outputs/train/smolvlm_act_libero_spatial_fullft_mlp_40k/` |
+| 500M Attentive (90k best) | `/data/smolvlm_outputs/lora_mlp_attentive/` |
+| 500M "Diffusion" = MLP run2 (120k) | `/data/smolvlm_outputs/lora_diffusion_120k/` |
+| 2.2B AT MLP run1 | `/home/ngseo/lerobot/outputs/train/smolvlm_act_libero_spatial_lora_mlp_2B/` + `/data/smolvlm_outputs/lora_mlp_2B/` |
+| 2.2B AT MLP run2 (130k-140k) | `/data/smolvlm_outputs/lora_diffusion_2B_150k/` (mislabeled name) |
+| 2.2B AT MLP run2 200k (150k-200k) | `/data/smolvlm_outputs/lora_mlp_2B_200k/` |
+| 2.2B Attentive 120k | `/data/smolvlm_outputs/lora_mlp_attentive_2B/` |
+| 2.2B Attentive 200k (120k-200k) | `/data/smolvlm_outputs/lora_mlp_attentive_2B_200k/` |
+| 2.2B Attentive chunk=20 | `/data/smolvlm_outputs/lora_attentive_mlp_2B_chunk20/` |
+| 2.2B AT + Diffusion (real) 150k | `/data/smolvlm_outputs/lora_diffusion_2B_150k_real/` |
+| 2.2B Attentive + Diffusion 150k | `/data/smolvlm_outputs/lora_attentive_diffusion_2B_150k/` |
+| Eval results | `/data/smolvlm_outputs/eval/` and `/home/ngseo/lerobot/outputs/eval/` |

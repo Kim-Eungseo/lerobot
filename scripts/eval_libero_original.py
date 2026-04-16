@@ -86,16 +86,31 @@ LIBERO_GOAL_TASKS = [
     "turn_on_the_stove",
 ]
 
+LIBERO_10_TASKS = [
+    "KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it",
+    "KITCHEN_SCENE4_put_the_black_bowl_in_the_bottom_drawer_of_the_cabinet_and_close_it",
+    "KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it",
+    "KITCHEN_SCENE8_put_both_moka_pots_on_the_stove",
+    "LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket",
+    "LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket",
+    "LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket",
+    "LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate",
+    "LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate",
+    "STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy",
+]
+
 LIBERO_TASKS = {
     "libero_spatial": LIBERO_SPATIAL_TASKS,
     "libero_object": LIBERO_OBJECT_TASKS,
     "libero_goal": LIBERO_GOAL_TASKS,
+    "libero_10": LIBERO_10_TASKS,
 }
 
 TASK_MAX_STEPS = {
     "libero_spatial": 280,
     "libero_object": 280,
     "libero_goal": 300,
+    "libero_10": 520,
 }
 
 
@@ -114,6 +129,10 @@ def parse_args():
     parser.add_argument("--attentive_pooling_heads", type=int, default=8)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=7)
+    # Temporal ensemble
+    parser.add_argument("--n_execute", type=int, default=None, help="Actions to execute before re-predict (default=chunk_size)")
+    parser.add_argument("--temporal_ensemble", action="store_true", help="Enable temporal ensemble (weighted avg of overlapping chunks)")
+    parser.add_argument("--ensemble_exp_weight", type=float, default=0.0, help="Exponential decay weight for ensemble (0=uniform)")
     return parser.parse_args()
 
 
@@ -193,54 +212,104 @@ def load_policy(args, device):
     return policy, preprocessor, cfg, action_mean, action_std
 
 
+def _predict_chunk(policy, preprocessor, obs, task_description, device, action_mean, action_std):
+    """Single forward pass: obs -> unnormalized action chunk (chunk_size, 7)."""
+    img = obs["agentview_image"][::-1, ::-1].copy()
+    img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+    eef_pos = obs["robot0_eef_pos"]
+    eef_quat = obs["robot0_eef_quat"]
+    gripper = obs["robot0_gripper_qpos"]
+    state = np.concatenate([eef_pos, quat2axisangle(eef_quat.copy()), gripper]).astype(np.float32)
+
+    batch = {
+        "observation.images.camera1": img_t.unsqueeze(0).to(device),
+        "observation.state": torch.from_numpy(state).unsqueeze(0).to(device),
+        "task": [task_description],
+    }
+    batch = preprocessor(batch)
+    policy.reset()
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        images, img_masks = policy.prepare_images(batch)
+        obs_state = policy.prepare_state(batch)
+        lang_tokens = batch["observation.language.tokens"]
+        lang_masks = batch["observation.language.attention_mask"]
+        action_chunk = policy.model.predict_actions(
+            images, img_masks, lang_tokens, lang_masks, obs_state
+        )
+    actions = action_chunk[0].float().cpu().numpy()[:, :7]
+
+    if action_mean is not None and action_std is not None:
+        actions = actions * (action_std[:7] + 1e-8) + action_mean[:7]
+
+    return actions
+
+
 @torch.no_grad()
 def run_episode(policy, preprocessor, env, task_description, max_steps, chunk_size, device,
-                action_mean=None, action_std=None):
-    """Run one episode, return success bool."""
-    action_queue = deque()
+                action_mean=None, action_std=None, n_execute=None, temporal_ensemble=False,
+                ensemble_exp_weight=0.0):
+    """Run one episode, return success bool.
+
+    Args:
+        n_execute: Number of actions to execute before re-predicting. Default=chunk_size (no overlap).
+        temporal_ensemble: If True, average overlapping action predictions with exponential weighting.
+        ensemble_exp_weight: Exponential weight for temporal ensemble (0=uniform, higher=favor newer).
+    """
+    if n_execute is None:
+        n_execute = chunk_size
+
     obs = env._last_obs
 
-    for t in range(max_steps):
-        if len(action_queue) == 0:
-            img = obs["agentview_image"][::-1, ::-1].copy()
-            img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+    if not temporal_ensemble:
+        # Simple re-prediction: execute n_execute steps, discard rest, re-predict
+        action_queue = deque()
+        for t in range(max_steps):
+            if len(action_queue) == 0:
+                actions = _predict_chunk(policy, preprocessor, obs, task_description, device,
+                                         action_mean, action_std)
+                for a in actions[:n_execute]:
+                    action_queue.append(a)
 
-            eef_pos = obs["robot0_eef_pos"]
-            eef_quat = obs["robot0_eef_quat"]
-            gripper = obs["robot0_gripper_qpos"]
-            state = np.concatenate([eef_pos, quat2axisangle(eef_quat.copy()), gripper]).astype(np.float32)
+            action = action_queue.popleft()
+            action[-1] = 1.0 if action[-1] >= 0.0 else -1.0
+            obs, reward, done, info = env.step(action.tolist())
+            if done:
+                return True
+    else:
+        # Temporal ensemble: accumulate overlapping predictions, weighted average
+        # action_buffer[t] = list of (prediction, weight) for timestep t
+        action_buffer = {}
+        next_predict_t = 0
 
-            batch = {
-                "observation.images.camera1": img_t.unsqueeze(0).to(device),
-                "observation.state": torch.from_numpy(state).unsqueeze(0).to(device),
-                "task": [task_description],
-            }
-            batch = preprocessor(batch)
-            policy.reset()
+        for t in range(max_steps):
+            # Predict new chunk if needed
+            if t >= next_predict_t:
+                actions = _predict_chunk(policy, preprocessor, obs, task_description, device,
+                                         action_mean, action_std)
+                for i, a in enumerate(actions):
+                    future_t = t + i
+                    if future_t not in action_buffer:
+                        action_buffer[future_t] = []
+                    weight = np.exp(-ensemble_exp_weight * i)
+                    action_buffer[future_t].append((a, weight))
+                next_predict_t = t + n_execute
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                images, img_masks = policy.prepare_images(batch)
-                obs_state = policy.prepare_state(batch)
-                lang_tokens = batch["observation.language.tokens"]
-                lang_masks = batch["observation.language.attention_mask"]
-                action_chunk = policy.model.predict_actions(
-                    images, img_masks, lang_tokens, lang_masks, obs_state
-                )
-            actions = action_chunk[0].float().cpu().numpy()[:, :7]
+            # Weighted average of all predictions for this timestep
+            if t in action_buffer:
+                preds = action_buffer[t]
+                total_weight = sum(w for _, w in preds)
+                action = sum(a * w for a, w in preds) / total_weight
+                del action_buffer[t]
+            else:
+                # Fallback: should not happen
+                action = np.zeros(7)
 
-            # Unnormalize actions using dataset stats
-            if action_mean is not None and action_std is not None:
-                actions = actions * (action_std[:7] + 1e-8) + action_mean[:7]
-
-            for a in actions:
-                action_queue.append(a)
-
-        action = action_queue.popleft()
-        action[-1] = 1.0 if action[-1] >= 0.0 else -1.0
-
-        obs, reward, done, info = env.step(action.tolist())
-        if done:
-            return True
+            action[-1] = 1.0 if action[-1] >= 0.0 else -1.0
+            obs, reward, done, info = env.step(action.tolist())
+            if done:
+                return True
 
     return False
 
@@ -311,7 +380,9 @@ def main():
             env._last_obs = obs
 
             success = run_episode(policy, preprocessor, env, task_description, max_steps, args.chunk_size, device,
-                                 action_mean=action_mean, action_std=action_std)
+                                 action_mean=action_mean, action_std=action_std,
+                                 n_execute=args.n_execute, temporal_ensemble=args.temporal_ensemble,
+                                 ensemble_exp_weight=args.ensemble_exp_weight)
             task_successes += int(success)
             total_successes += int(success)
             total_episodes += 1
